@@ -1,0 +1,25 @@
+﻿<resources>
+    <string name="app_name">Columbia</string>
+
+    <string name="ok">موافق</string>
+    <string name="cancel">إلغاء</string>
+    <string name="yes">نعم</string>
+    <string name="no">لا</string>
+    <string name="back">رجوع</string>
+    <string name="next">التالي</string>
+    <string name="skip">تخطي</string>
+    <string name="done">تم</string>
+    <string name="save">حفظ</string>
+    <string name="close">إغلاق</string>
+    <string name="confirm">تأكيد</string>
+    <string name="retry">إعادة المحاولة</string>
+    <string name="loading">جارٍ التحميل…</string>
+    <string name="error">خطأ</string>
+    <string name="error_generic">حدث خطأ ما. يرجى المحاولة مرة أخرى.</string>
+    <string name="home">الرئيسية</string>
+    <string name="settings">الإعدادات</string>
+    <string name="language">اللغة</string>
+
+    <string name="select_language">اختر اللغة</string>
+    <string name="select_region">اختر المنطقة</string>
+</resources>

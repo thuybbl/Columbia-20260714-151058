@@ -1,0 +1,25 @@
+﻿<resources>
+    <string name="app_name">Columbia</string>
+
+    <string name="ok">OK</string>
+    <string name="cancel">Hủy</string>
+    <string name="yes">Có</string>
+    <string name="no">Không</string>
+    <string name="back">Quay lại</string>
+    <string name="next">Tiếp theo</string>
+    <string name="skip">Bỏ qua</string>
+    <string name="done">Xong</string>
+    <string name="save">Lưu</string>
+    <string name="close">Đóng</string>
+    <string name="confirm">Xác nhận</string>
+    <string name="retry">Thử lại</string>
+    <string name="loading">Đang tải…</string>
+    <string name="error">Lỗi</string>
+    <string name="error_generic">Đã xảy ra lỗi. Vui lòng thử lại.</string>
+    <string name="home">Trang chủ</string>
+    <string name="settings">Cài đặt</string>
+    <string name="language">Ngôn ngữ</string>
+
+    <string name="select_language">Chọn ngôn ngữ</string>
+    <string name="select_region">Chọn khu vực</string>
+</resources>

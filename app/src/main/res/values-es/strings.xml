@@ -1,0 +1,25 @@
+﻿<resources>
+    <string name="app_name">Columbia</string>
+
+    <string name="ok">Aceptar</string>
+    <string name="cancel">Cancelar</string>
+    <string name="yes">Sí</string>
+    <string name="no">No</string>
+    <string name="back">Atrás</string>
+    <string name="next">Siguiente</string>
+    <string name="skip">Omitir</string>
+    <string name="done">Listo</string>
+    <string name="save">Guardar</string>
+    <string name="close">Cerrar</string>
+    <string name="confirm">Confirmar</string>
+    <string name="retry">Reintentar</string>
+    <string name="loading">Cargando…</string>
+    <string name="error">Error</string>
+    <string name="error_generic">Algo salió mal. Inténtalo de nuevo.</string>
+    <string name="home">Inicio</string>
+    <string name="settings">Ajustes</string>
+    <string name="language">Idioma</string>
+
+    <string name="select_language">Seleccionar idioma</string>
+    <string name="select_region">Seleccionar región</string>
+</resources>

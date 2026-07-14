@@ -1,0 +1,25 @@
+﻿<resources>
+    <string name="app_name">Columbia</string>
+
+    <string name="ok">확인</string>
+    <string name="cancel">취소</string>
+    <string name="yes">예</string>
+    <string name="no">아니요</string>
+    <string name="back">뒤로</string>
+    <string name="next">다음</string>
+    <string name="skip">건너뛰기</string>
+    <string name="done">완료</string>
+    <string name="save">저장</string>
+    <string name="close">닫기</string>
+    <string name="confirm">확인</string>
+    <string name="retry">다시 시도</string>
+    <string name="loading">로딩 중…</string>
+    <string name="error">오류</string>
+    <string name="error_generic">문제가 발생했습니다. 다시 시도해 주세요.</string>
+    <string name="home">홈</string>
+    <string name="settings">설정</string>
+    <string name="language">언어</string>
+
+    <string name="select_language">언어 선택</string>
+    <string name="select_region">지역 선택</string>
+</resources>
