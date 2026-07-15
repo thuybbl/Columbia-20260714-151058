@@ -80,6 +80,7 @@ dependencies {
     implementation(libs.androidx.ui.graphics)
     implementation(libs.androidx.ui.tooling.preview)
     implementation(libs.androidx.material3)
+    implementation("androidx.compose.material:material-icons-extended")
 
     implementation(libs.google.material)
     implementation(libs.androidx.navigation.compose.android)
@@ -97,6 +98,8 @@ dependencies {
     implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.8.0")
     implementation("io.coil-kt:coil-compose:2.6.0")
     implementation("com.airbnb.android:lottie-compose:6.6.2")
+    // [Columbia] crop ảnh đầu vào cho image-to-video (uCrop — UX tốt + themeable khớp thiết kế)
+    implementation("com.github.yalantis:ucrop:2.2.9")
 
 
 

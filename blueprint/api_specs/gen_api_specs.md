@@ -2,6 +2,12 @@
 
 > **Base URL:** `https://dashscope-intl.aliyuncs.com/api/v1`
 
+> ✅ **ĐÍNH CHÍNH ĐÃ KIỂM CHỨNG (App-Factory):** Tài liệu bên dưới ghi `wan2.7-i2v` `media[].url`
+> "chỉ nhận public HTTP/HTTPS URL" — **SAI**. Đã test call thật (task SUCCEEDED): trường `url` **CHẤP NHẬN
+> base64 data URI** dạng `data:image/jpeg;base64,{...}`. → Ảnh user import/crop (local) đưa **thẳng base64**
+> vào Part B, **KHÔNG cần** upload/host/Firebase Storage/backend. Áp dụng cho cả Part A và Part B.
+> "Text→video" ghép chuỗi: `text → Part A (ra ảnh) → Part B (ảnh→video)`.
+
 ---
 
 ## Table of Contents

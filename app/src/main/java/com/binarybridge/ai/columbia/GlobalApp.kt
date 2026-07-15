@@ -10,6 +10,8 @@ import com.bbl.ads.modules.configs.GlobalConfig
 import com.binarybridge.ai.columbia.ads.AdsLoader
 import com.binarybridge.ai.columbia.ads.AdsPolicy
 import com.binarybridge.ai.columbia.core.SettingManager
+import com.binarybridge.ai.columbia.core.file.FileManager
+import com.binarybridge.ai.columbia.data.json.CreationRepo
 import com.binarybridge.ai.columbia.features.iap.Iap
 import com.vungle.ads.internal.ui.AdActivity
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -41,6 +43,8 @@ class GlobalApp : AdsMultiDexApplication() {
         super.onCreate()
 
         SettingManager.init(this)
+        FileManager.init(this)
+        CreationRepo.init(this)
 
         AdsManager.getInstance().apply {
             disableAppResumeWithActivity(AdActivity::class.java)

@@ -22,7 +22,7 @@ import androidx.compose.animation.scaleOut
 import androidx.compose.animation.slideInHorizontally
 import androidx.compose.animation.slideInVertically
 import androidx.compose.animation.slideOutHorizontally
-import com.binarybridge.ai.columbia.features.home.HomeScreen
+import com.binarybridge.ai.columbia.features.main.MainScreen
 import com.binarybridge.ai.columbia.features.language.LanguageScreen
 import com.binarybridge.ai.columbia.features.onboarding.OnboardingScreen
 
@@ -111,7 +111,7 @@ fun App() {
                 }
             )
             AppScreen.Home -> {
-                HomeScreen()
+                MainScreen()
                 CheckForConsent()
             }
         }

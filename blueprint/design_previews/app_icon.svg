@@ -1,0 +1,39 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <!-- Columbia app icon.
+       Ý tưởng: tia sáng sparkle 4 cánh (khoảnh khắc "ý tưởng bừng sáng thành video") trên nền dải quang phổ tím→magenta (motif "Spectrum").
+       Nền (ic_launcher_background): gradient tím đậm → magenta.  Foreground (ic_launcher_foreground): sparkle trắng + glow.
+       Safe-zone: nội dung chính nằm trong ~66% trung tâm (vòng tròn tham chiếu) để không bị cắt khi Android bo tròn. -->
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#6D28D9"/>
+      <stop offset="1" stop-color="#C026D3"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0" stop-color="#ffffff" stop-opacity="0.9"/>
+      <stop offset="0.5" stop-color="#E9D5FF" stop-opacity="0.35"/>
+      <stop offset="1" stop-color="#ffffff" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+
+  <!-- === BACKGROUND layer === -->
+  <rect width="512" height="512" rx="112" fill="url(#bg)"/>
+  <circle cx="150" cy="130" r="220" fill="#ffffff" opacity="0.06"/>
+
+  <!-- safe-zone reference (không xuất vào icon thật) -->
+  <circle cx="256" cy="256" r="169" fill="none" stroke="#ffffff" stroke-opacity="0.0"/>
+
+  <!-- === FOREGROUND layer === -->
+  <circle cx="256" cy="256" r="150" fill="url(#glow)"/>
+  <!-- sparkle 4 cánh (concave diamond) -->
+  <path fill="#ffffff" d="M256 116
+    C 268 196, 300 228, 380 240
+    C 300 252, 268 284, 256 364
+    C 244 284, 212 252, 132 240
+    C 212 228, 244 196, 256 116 Z"/>
+  <!-- sparkle phụ nhỏ -->
+  <path fill="#ffffff" opacity="0.95" d="M360 150
+    C 365 178, 380 193, 408 198
+    C 380 203, 365 218, 360 246
+    C 355 218, 340 203, 312 198
+    C 340 193, 355 178, 360 150 Z"/>
+</svg>
