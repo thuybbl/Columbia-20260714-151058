@@ -1,0 +1,93 @@
+# frozen_string_literal: true
+
+default_platform(:android)
+
+def setup_release_notes
+  notes = ENV.fetch("RELEASE_NOTES", "").strip
+  return if notes.empty?
+
+  # Fastlane supply expects changelogs to be in:
+  # .github/fastlane/metadata/android/en-US/changelogs/<version_code>.txt
+  # default version code for default changelog is 'default.txt'
+  
+  version_code = ENV["VERSION_CODE"] || ENV["VERSION_CODE_INPUT"] || "default"
+  if version_code.to_s.strip.empty?
+    version_code = "default"
+  end
+
+  dir_path = "metadata/android/en-US/changelogs"
+  FileUtils.mkdir_p(dir_path)
+  
+  file_path = "#{dir_path}/#{version_code}.txt"
+  File.write(file_path, notes)
+  
+  UI.message("Created release notes file at #{file_path}")
+end
+
+def supply_common_options
+  {
+    package_name: ENV.fetch("PLAY_PACKAGE_NAME"),
+    json_key_data: ENV["PLAY_SERVICE_ACCOUNT_JSON"] || File.read(ENV.fetch("PLAY_JSON_KEY_PATH")),
+    rescue_changes_not_sent_for_review: true,
+    skip_upload_apk: true,
+    skip_upload_metadata: true,
+    skip_upload_images: true,
+    skip_upload_screenshots: true
+  }
+end
+
+platform :android do
+  desc "Upload AAB to open testing (beta track)"
+  lane :upload_open do
+    setup_release_notes
+    upload_to_play_store(
+      supply_common_options.merge(
+        track: "beta",
+        aab: ENV.fetch("AAB_PATH"),
+        release_status: ENV.fetch("RELEASE_STATUS", "completed")
+      )
+    )
+  end
+
+  desc "Upload AAB to production track"
+  lane :upload_production do
+    setup_release_notes
+    opts = supply_common_options.merge(
+      track: "production",
+      aab: ENV.fetch("AAB_PATH"),
+      release_status: ENV.fetch("RELEASE_STATUS", "completed")
+    )
+    rollout = ENV["ROLLOUT"].to_s.strip
+    opts[:rollout] = rollout unless rollout.empty?
+    upload_to_play_store(opts)
+  end
+
+  desc "Promote latest open testing release to production (no re-upload)"
+  lane :promote_to_production do
+    setup_release_notes
+    version_code = ENV["VERSION_CODE_INPUT"].to_s.strip
+    opts = supply_common_options.merge(
+      track: "beta",
+      track_promote_to: "production",
+      skip_upload_aab: true,
+      skip_upload_apk: true,
+      release_status: ENV.fetch("RELEASE_STATUS", "completed")
+    )
+    opts[:version_code] = version_code.to_i unless version_code.empty?
+    rollout = ENV["ROLLOUT"].to_s.strip
+    opts[:rollout] = rollout unless rollout.empty?
+    upload_to_play_store(opts)
+  end
+
+  desc "Validate release metadata and bundle without committing"
+  lane :validate_release do
+    setup_release_notes
+    upload_to_play_store(
+      supply_common_options.merge(
+        track: ENV.fetch("PLAY_TRACK", "beta"),
+        aab: ENV.fetch("AAB_PATH"),
+        validate_only: true
+      )
+    )
+  end
+end

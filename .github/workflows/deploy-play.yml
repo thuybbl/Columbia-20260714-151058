@@ -1,0 +1,224 @@
+name: Deploy to Google Play
+
+permissions:
+  contents: read
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g. v1.1.2)"
+        required: true
+        type: string
+      mode:
+        description: "Deploy mode"
+        required: true
+        type: choice
+        options:
+          - upload_open
+          - upload_production
+          - promote_to_production
+      version_code:
+        description: "Version code (promote only; empty = latest on beta)"
+        required: false
+        type: string
+      rollout:
+        description: "Staged rollout fraction for production (e.g. 0.1 = 10%)"
+        required: false
+        type: string
+      release_status:
+        description: "Play release status"
+        required: false
+        default: completed
+        type: choice
+        options:
+          - completed
+          - draft
+          - inProgress
+          - halted
+      release_notes:
+        description: "What's new (en-US, max 500 chars)"
+        required: false
+        type: string
+      triggered_by:
+        description: "Discord user or actor name"
+        required: false
+        type: string
+
+jobs:
+  deploy:
+    runs-on: [self-hosted, ubuntu32]
+    env:
+      TAG_NAME: ${{ github.event.inputs.tag }}
+      MODE: ${{ github.event.inputs.mode }}
+      VERSION_CODE_INPUT: ${{ github.event.inputs.version_code }}
+      ROLLOUT: ${{ github.event.inputs.rollout }}
+      RELEASE_STATUS: ${{ github.event.inputs.release_status }}
+      RELEASE_NOTES: ${{ github.event.inputs.release_notes }}
+      ACTOR: ${{ github.event.inputs.triggered_by || github.actor }}
+      REPO_NAME: ${{ github.repository }}
+      RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+    steps:
+      - name: Checkout tag
+        uses: actions/checkout@v4
+
+      - name: Extract version info
+        id: version
+        run: |
+          VERSION_NAME=$(grep -E '^[[:space:]]*versionName[[:space:]]*=' app/build.gradle.kts | head -1 | sed -E 's/.*versionName[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/')
+          VERSION_CODE=$(grep -E '^[[:space:]]*versionCode[[:space:]]*=' app/build.gradle.kts | head -1 | sed -E 's/.*versionCode[[:space:]]*=[[:space:]]*([0-9]+).*/\1/')
+          echo "VERSION_NAME=$VERSION_NAME" >> "$GITHUB_OUTPUT"
+          echo "VERSION_CODE=$VERSION_CODE" >> "$GITHUB_ENV"
+
+      - name: Notify Discord — started
+        env:
+          DISCORD_DEPLOY_WEBHOOK_URL: ${{ secrets.DISCORD_DEPLOY_WEBHOOK_URL }}
+          PLAY_PACKAGE_NAME: ${{ secrets.PLAY_PACKAGE_NAME }}
+        run: bash scripts/discord-deploy-notify.sh started
+
+      - name: Set up Ruby
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.2"
+          bundler-cache: false
+
+      - name: Install fastlane
+        run: gem install fastlane -NV --no-document
+
+      - name: Setup Play service account key
+        run: |
+          echo "${{ secrets.PLAY_SERVICE_ACCOUNT_JSON }}" | base64 -d > /tmp/play-sa.json
+          chmod 600 /tmp/play-sa.json
+          echo "PLAY_JSON_KEY_PATH=/tmp/play-sa.json" >> "$GITHUB_ENV"
+
+      - name: Compute Nexus AAB path
+        if: github.event.inputs.mode != 'promote_to_production'
+        id: nexus
+        run: |
+          TAG="${{ github.event.inputs.tag }}"
+          REPO="${GITHUB_REPOSITORY##*/}"
+          TAG_SAFE=$(printf '%s' "$TAG" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9._-]/_/g')
+          REPO_SAFE=$(printf '%s' "$REPO" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9._-]/_/g')
+          BASENAME="${REPO_SAFE}_${TAG_SAFE}_vc${VERSION_CODE}"
+          AAB_NAME="${BASENAME}.aab"
+          NEXUS_URL="${{ secrets.NEXUS_URL }}"
+          RAW_REPO="${{ secrets.NEXUS_RAW_REPO }}"
+          AAB_URL="${NEXUS_URL%/}/repository/${RAW_REPO}/android/${REPO}/${TAG}/${AAB_NAME}"
+          echo "AAB_URL=$AAB_URL" >> "$GITHUB_OUTPUT"
+          echo "AAB_PATH=${{ runner.temp }}/$AAB_NAME" >> "$GITHUB_OUTPUT"
+
+      - name: Download AAB from Nexus
+        if: github.event.inputs.mode != 'promote_to_production'
+        run: |
+          curl -f --retry 3 --retry-delay 2 \
+            -u "${{ secrets.NEXUS_USER }}:${{ secrets.NEXUS_PASS }}" \
+            -o "${{ steps.nexus.outputs.AAB_PATH }}" \
+            "${{ steps.nexus.outputs.AAB_URL }}"
+          ls -lh "${{ steps.nexus.outputs.AAB_PATH }}"
+          echo "AAB_PATH=${{ steps.nexus.outputs.AAB_PATH }}" >> "$GITHUB_ENV"
+
+      - name: Validate release (fastlane)
+        if: github.event.inputs.mode != 'promote_to_production'
+        id: validate
+        continue-on-error: true
+        env:
+          PLAY_PACKAGE_NAME: ${{ secrets.PLAY_PACKAGE_NAME }}
+          RELEASE_NOTES: ${{ github.event.inputs.release_notes }}
+          PLAY_TRACK: ${{ github.event.inputs.mode == 'upload_production' && 'production' || 'beta' }}
+        run: |
+          set -o pipefail
+          cd .github/fastlane
+          fastlane validate_release 2>&1 | tee "${{ runner.temp }}/fastlane.log"
+
+      - name: Run fastlane deploy lane
+        id: supply
+        continue-on-error: true
+        env:
+          PLAY_PACKAGE_NAME: ${{ secrets.PLAY_PACKAGE_NAME }}
+          RELEASE_NOTES: ${{ github.event.inputs.release_notes }}
+          RELEASE_STATUS: ${{ github.event.inputs.release_status }}
+          ROLLOUT: ${{ github.event.inputs.rollout }}
+          VERSION_CODE: ${{ github.event.inputs.version_code }}
+        run: |
+          set -o pipefail
+          LANE="${{ github.event.inputs.mode }}"
+          cd .github/fastlane
+          fastlane "$LANE" 2>&1 | tee -a "${{ runner.temp }}/fastlane.log"
+
+      - name: Parse fastlane result
+        if: always()
+        id: result
+        run: |
+          LOG="${{ runner.temp }}/fastlane.log"
+          NEEDS_MANUAL=false
+          ERROR_MSG=""
+          VALIDATE_OK=true
+          SUPPLY_OK=true
+
+          if [ "${{ steps.validate.outcome }}" = "failure" ]; then
+            VALIDATE_OK=false
+          fi
+          if [ "${{ steps.supply.outcome }}" = "failure" ]; then
+            SUPPLY_OK=false
+          fi
+
+          if [ -f "$LOG" ]; then
+            if grep -q "changesNotSentForReview to true" "$LOG"; then
+              NEEDS_MANUAL=true
+            fi
+            if [ "$VALIDATE_OK" = false ] || [ "$SUPPLY_OK" = false ]; then
+              ERROR_MSG=$(tail -40 "$LOG" | head -c 900)
+            fi
+          fi
+
+          echo "needs_manual=$NEEDS_MANUAL" >> "$GITHUB_OUTPUT"
+          echo "validate_ok=$VALIDATE_OK" >> "$GITHUB_OUTPUT"
+          echo "supply_ok=$SUPPLY_OK" >> "$GITHUB_OUTPUT"
+          {
+            echo "error_msg<<EOF"
+            echo "$ERROR_MSG"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Notify Discord — final status
+        if: always()
+        env:
+          DISCORD_DEPLOY_WEBHOOK_URL: ${{ secrets.DISCORD_DEPLOY_WEBHOOK_URL }}
+          DISCORD_RELEASE_MANAGER_IDS: ${{ vars.DISCORD_RELEASE_MANAGER_IDS || secrets.DISCORD_RELEASE_MANAGER_IDS }}
+          PLAY_PACKAGE_NAME: ${{ secrets.PLAY_PACKAGE_NAME }}
+          ERROR_MSG: ${{ steps.result.outputs.error_msg }}
+        run: |
+          chmod +x scripts/discord-deploy-notify.sh
+          
+          if [ "${{ job.status }}" = "failure" ] && [ "${{ steps.result.outputs.validate_ok }}" != "false" ] && [ "${{ steps.result.outputs.supply_ok }}" != "false" ]; then
+            echo "Job failed before or outside fastlane steps."
+            bash scripts/discord-deploy-notify.sh commit_failed
+            exit 1
+          fi
+
+          if [ "${{ job.status }}" = "cancelled" ]; then
+            bash scripts/discord-deploy-notify.sh cancelled
+            exit 0
+          fi
+
+          if [ "${{ steps.result.outputs.validate_ok }}" = "false" ]; then
+            bash scripts/discord-deploy-notify.sh validate_failed
+            exit 1
+          fi
+
+          if [ "${{ steps.result.outputs.supply_ok }}" = "false" ]; then
+            bash scripts/discord-deploy-notify.sh commit_failed
+            exit 1
+          fi
+
+          if [ "${{ steps.result.outputs.needs_manual }}" = "true" ]; then
+            bash scripts/discord-deploy-notify.sh action_required
+            exit 0
+          fi
+
+          bash scripts/discord-deploy-notify.sh submitted
+
+      - name: Cleanup service account key
+        if: always()
+        run: rm -f /tmp/play-sa.json

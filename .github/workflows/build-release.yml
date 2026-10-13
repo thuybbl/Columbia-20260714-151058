@@ -1,0 +1,430 @@
+name: Build Release APK/AAB
+
+permissions:
+  contents: write
+
+on:
+  push:
+    tags:
+      - 'v*'     # release tags, e.g. v1.0.0
+      - '!*-rc'  # not *-rc (scripts/release.sh rc → test-rc-build.yml)
+      - '!*-test' # not *-test (scripts/release.sh test → test-rc-build.yml)
+
+jobs:
+  build:
+    runs-on: [self-hosted, ubuntu32]
+    # *-rc / *-test tags: excluded via tags-ignore (test-rc-build.yml); keep guard if filter changes
+    if: "!endsWith(github.ref, '-rc') && !endsWith(github.ref, '-test')"
+
+    env:
+      RELEASE_STORE_FILE: ${{ github.workspace }}/app/keystore.jks
+      RELEASE_STORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+      RELEASE_KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+      RELEASE_KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+      # settings.gradle.kts reads GITHUB_ACTOR / GITHUB_TOKEN (NV_* kept as legacy fallback)
+      GITHUB_ACTOR: ${{ secrets.GITHUB_ACTOR || secrets.NV_ACTOR || github.actor }}
+      GITHUB_TOKEN: ${{ secrets.GH_PACKAGES_TOKEN || secrets.NV_TOKEN || github.token }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          # Default also installs 'tools', which the SDK repo no longer provides (sdkmanager exits 1).
+          packages: 'platform-tools'
+
+      - name: Grant execute permission for gradlew
+        run: chmod +x gradlew
+
+      # Self-hosted runners reuse ~/.gradle; corrupt transform metadata (metadata.bin)
+      # breaks Hilt (:app:hiltAggregateDeps*). Wiping transforms + no CC avoids flakiness.
+      - name: Prepare Gradle (self-hosted)
+        run: |
+          ./gradlew --stop 2>/dev/null || true
+          if [ -d "$HOME/.gradle/caches" ]; then
+            find "$HOME/.gradle/caches" -mindepth 2 -maxdepth 2 -type d -name transforms -prune -exec rm -rf {} +
+          fi
+
+      - name: Setup Keystore
+        run: |
+          echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 -d > app/keystore.jks
+          echo "Keystore file created"
+          ls -lh app/keystore.jks
+
+      - name: Setup google-services.json
+        run: |
+          set -euo pipefail
+          if [ -z "${{ secrets.GOOGLE_SERVICES_JSON_BASE64 }}" ]; then
+            echo "::error::Secret GOOGLE_SERVICES_JSON_BASE64 is empty. Encode PRODUCTION app/google-services.json (scripts/gen-env-base64.sh) and push via scripts/push-secret.sh. Org secrets do not include this — it is per-app."
+            exit 1
+          fi
+          echo "${{ secrets.GOOGLE_SERVICES_JSON_BASE64 }}" | base64 -d > app/google-services.json
+          echo "google-services.json created"
+          ls -lh app/google-services.json
+
+      # Prefer prod flavor when present (AF shipping apps); else plain release (code_base default).
+      - name: Build Release APK and AAB
+        run: |
+          set -euo pipefail
+          if grep -qE 'create\("prod"\)' app/build.gradle.kts; then
+            ./gradlew assembleProdRelease bundleProdRelease --build-cache --parallel --no-daemon --no-configuration-cache
+          else
+            ./gradlew assembleRelease bundleRelease --build-cache --parallel --no-daemon --no-configuration-cache
+          fi
+
+      - name: Cleanup secrets on disk
+        if: always()
+        run: |
+          rm -f app/keystore.jks app/google-services.json
+          echo "Keystore and google-services.json removed for security"
+
+      - name: Collect outputs to local tmp
+        id: collect
+        run: |
+          set -euo pipefail
+          DIST_DIR="/tmp/gh-dist-${{ github.run_id }}"
+          mkdir -p "${DIST_DIR}/apk" "${DIST_DIR}/bundle"
+
+          TAG_RAW="${{ github.ref_name }}"
+          REPO_NAME="${{ github.event.repository.name }}"
+          VERSION_CODE=$(grep -E '^[[:space:]]*versionCode[[:space:]]*=' app/build.gradle.kts | head -1 | sed -E 's/.*versionCode[[:space:]]*=[[:space:]]*([0-9]+).*/\1/')
+          TAG_SAFE=$(printf '%s' "$TAG_RAW" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9._-]/_/g')
+          REPO_SAFE=$(printf '%s' "$REPO_NAME" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9._-]/_/g')
+          BASENAME="${REPO_SAFE}_${TAG_SAFE}_vc${VERSION_CODE}"
+
+          APK=$(find app/build/outputs/apk -path '*/release/*.apk' -type f | head -1)
+          if [ -z "$APK" ]; then
+            echo "APK file not found under app/build/outputs/apk/**/release/"
+            exit 1
+          fi
+          cp "$APK" "${DIST_DIR}/apk/${BASENAME}.apk"
+          echo "Collected APK: $APK -> ${DIST_DIR}/apk/${BASENAME}.apk"
+
+          AAB=$(find app/build/outputs/bundle -name "*.aab" -type f | head -1)
+          if [ -z "$AAB" ]; then
+            echo "AAB file not found under app/build/outputs/bundle/"
+            exit 1
+          fi
+          cp "$AAB" "${DIST_DIR}/bundle/${BASENAME}.aab"
+          echo "Collected AAB: $AAB -> ${DIST_DIR}/bundle/${BASENAME}.aab"
+
+          ls -laR "${DIST_DIR}"
+  upload_and_release:
+    needs: build
+    runs-on: [self-hosted, ubuntu32]
+    if: needs.build.result == 'success'
+    outputs:
+      apk_url: ${{ steps.upload_apk.outputs.APK_URL }}
+      aab_url: ${{ steps.upload_aab.outputs.AAB_URL }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set release artifact basename (repo_tag)
+        run: |
+          TAG_RAW="${{ github.ref_name }}"
+          REPO_NAME="${{ github.event.repository.name }}"
+          VERSION_CODE=$(grep -E '^[[:space:]]*versionCode[[:space:]]*=' app/build.gradle.kts | head -1 | sed -E 's/.*versionCode[[:space:]]*=[[:space:]]*([0-9]+).*/\1/')
+          TAG_SAFE=$(printf '%s' "$TAG_RAW" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9._-]/_/g')
+          REPO_SAFE=$(printf '%s' "$REPO_NAME" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9._-]/_/g')
+          echo "ARTIFACT_BASENAME=${REPO_SAFE}_${TAG_SAFE}_vc${VERSION_CODE}" >> "$GITHUB_ENV"
+
+      - name: Verify local dist exists
+        run: |
+          DIST_DIR="/tmp/gh-dist-${{ github.run_id }}"
+          if [ ! -f "${DIST_DIR}/apk/${ARTIFACT_BASENAME}.apk" ] || [ ! -f "${DIST_DIR}/bundle/${ARTIFACT_BASENAME}.aab" ]; then
+            echo "ERROR: dist files not found at ${DIST_DIR}"
+            ls -laR "${DIST_DIR}" 2>/dev/null || echo "(directory missing)"
+            exit 1
+          fi
+          echo "dist OK:"
+          ls -lh "${DIST_DIR}/apk/${ARTIFACT_BASENAME}.apk" "${DIST_DIR}/bundle/${ARTIFACT_BASENAME}.aab"
+
+      - name: Delete existing GitHub release for tag (required before create)
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          TAG_NAME: ${{ github.ref_name }}
+        run: bash scripts/gh_delete_release_for_tag.sh
+
+      - name: Upload APK to Nexus
+        id: upload_apk
+        env:
+          NEXUS_URL: ${{ secrets.NEXUS_URL }}
+          NEXUS_USER: ${{ secrets.NEXUS_USER }}
+          NEXUS_PASS: ${{ secrets.NEXUS_PASS }}
+          NEXUS_RAW_REPO: ${{ secrets.NEXUS_RAW_REPO }}
+        run: |
+          set -euo pipefail
+          TAG="${{ github.ref_name }}"
+          REPO_NAME="${GITHUB_REPOSITORY##*/}"
+          APK_SRC="/tmp/gh-dist-${{ github.run_id }}/apk/${ARTIFACT_BASENAME}.apk"
+          APK_NAME="$(basename "$APK_SRC")"
+          if [ -z "${NEXUS_URL:-}" ] || [ -z "${NEXUS_USER:-}" ] || [ -z "${NEXUS_PASS:-}" ] || [ -z "${NEXUS_RAW_REPO:-}" ]; then
+            echo "Nexus secrets missing — skip Nexus upload; GitHub Release will attach the APK."
+            echo "APK_URL=" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          APK_URL="${NEXUS_URL%/}/repository/${NEXUS_RAW_REPO}/android/${REPO_NAME}/${TAG}/${APK_NAME}"
+          curl -f --retry 3 --retry-delay 2 \
+            -u "${NEXUS_USER}:${NEXUS_PASS}" \
+            --upload-file "$APK_SRC" \
+            "$APK_URL"
+          echo "APK_URL=$APK_URL" >> $GITHUB_OUTPUT
+          echo "Uploaded APK to: $APK_URL"
+
+      - name: Upload AAB to Nexus
+        id: upload_aab
+        env:
+          NEXUS_URL: ${{ secrets.NEXUS_URL }}
+          NEXUS_USER: ${{ secrets.NEXUS_USER }}
+          NEXUS_PASS: ${{ secrets.NEXUS_PASS }}
+          NEXUS_RAW_REPO: ${{ secrets.NEXUS_RAW_REPO }}
+        run: |
+          set -euo pipefail
+          TAG="${{ github.ref_name }}"
+          REPO_NAME="${GITHUB_REPOSITORY##*/}"
+          AAB_SRC="/tmp/gh-dist-${{ github.run_id }}/bundle/${ARTIFACT_BASENAME}.aab"
+          AAB_NAME="$(basename "$AAB_SRC")"
+          if [ -z "${NEXUS_URL:-}" ] || [ -z "${NEXUS_USER:-}" ] || [ -z "${NEXUS_PASS:-}" ] || [ -z "${NEXUS_RAW_REPO:-}" ]; then
+            echo "Nexus secrets missing — skip Nexus upload; GitHub Release will attach the AAB."
+            echo "AAB_URL=" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          AAB_URL="${NEXUS_URL%/}/repository/${NEXUS_RAW_REPO}/android/${REPO_NAME}/${TAG}/${AAB_NAME}"
+          curl -f --retry 3 --retry-delay 2 \
+            -u "${NEXUS_USER}:${NEXUS_PASS}" \
+            --upload-file "$AAB_SRC" \
+            "$AAB_URL"
+          echo "AAB_URL=$AAB_URL" >> $GITHUB_OUTPUT
+          echo "Uploaded AAB to: $AAB_URL"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: Release ${{ github.ref_name }}
+          files: |
+            /tmp/gh-dist-${{ github.run_id }}/apk/${{ env.ARTIFACT_BASENAME }}.apk
+            /tmp/gh-dist-${{ github.run_id }}/bundle/${{ env.ARTIFACT_BASENAME }}.aab
+          body: |
+            Automated build for tag `${{ github.ref_name }}`.
+
+            APK and AAB are attached to this release.
+            Nexus APK: ${{ steps.upload_apk.outputs.APK_URL || '(skipped — secrets not set)' }}
+            Nexus AAB: ${{ steps.upload_aab.outputs.AAB_URL || '(skipped — secrets not set)' }}
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+
+      - name: Cleanup local tmp dist
+        if: always()
+        run: rm -rf "/tmp/gh-dist-${{ github.run_id }}"
+
+  notify_discord:
+    needs:
+      - build
+      - upload_and_release
+    runs-on: [self-hosted, ubuntu32]
+    if: always()
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Extract version info
+        id: version_info
+        run: |
+          VERSION_NAME=$(grep -E '^[[:space:]]*versionName[[:space:]]*=' app/build.gradle.kts | head -1 | sed -E 's/.*versionName[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/')
+          VERSION_CODE=$(grep -E '^[[:space:]]*versionCode[[:space:]]*=' app/build.gradle.kts | head -1 | sed -E 's/.*versionCode[[:space:]]*=[[:space:]]*([0-9]+).*/\1/')
+          echo "VERSION_NAME=$VERSION_NAME" >> $GITHUB_OUTPUT
+          echo "VERSION_CODE=$VERSION_CODE" >> $GITHUB_OUTPUT
+
+      - name: Get commit list
+        id: commit_list
+        run: |
+          git fetch --tags --force
+          TAG="${{ github.ref_name }}"
+          PREV_TAG=$(git tag --sort=-version:refname | grep -v "^${TAG}$" | head -1 || echo "")
+          if [ -z "$PREV_TAG" ]; then
+            COMMITS=$(git log --pretty=format:"- %s (%h)" --no-merges HEAD)
+          else
+            COMMITS=$(git log ${PREV_TAG}..HEAD --pretty=format:"- %s (%h)" --no-merges)
+          fi
+          if [ -z "$COMMITS" ]; then
+            COMMITS="No commits found"
+          fi
+          {
+            echo "COMMITS<<EOF"
+            echo "$COMMITS"
+            echo "EOF"
+          } >> $GITHUB_OUTPUT
+
+      - name: Format Discord user tags
+        id: discord_tags
+        env:
+          DISCORD_USER_IDS: ${{ vars.DISCORD_USER_IDS || secrets.DISCORD_USER_IDS }}
+        run: |
+          if [ -z "$DISCORD_USER_IDS" ]; then
+            echo "USER_TAGS=" >> $GITHUB_OUTPUT
+          else
+            TAGS=$(echo "$DISCORD_USER_IDS" | tr ',' '\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | sed 's/^/<@/' | sed 's/$/>/' | tr '\n' ' ')
+            echo "USER_TAGS=$TAGS" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Send Discord notification
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          BUILD_RESULT: ${{ needs.build.result }}
+          UPLOAD_RESULT: ${{ needs.upload_and_release.result }}
+          # Public download UI (not Nexus direct). Override via repo var DOWNLOAD_PORTAL_BASE.
+          DOWNLOAD_PORTAL_BASE: ${{ vars.DOWNLOAD_PORTAL_BASE || 'https://download.stemlabs.site' }}
+          TAG_NAME: ${{ github.ref_name }}
+          USER_TAGS: ${{ steps.discord_tags.outputs.USER_TAGS }}
+          VERSION_NAME: ${{ steps.version_info.outputs.VERSION_NAME }}
+          VERSION_CODE: ${{ steps.version_info.outputs.VERSION_CODE }}
+          COMMITS_RAW: ${{ steps.commit_list.outputs.COMMITS }}
+        run: |
+          if [ -z "$DISCORD_WEBHOOK_URL" ]; then
+            echo "DISCORD_WEBHOOK_URL not set. Skipping Discord notification."
+            exit 0
+          fi
+
+          # Determine overall status
+          if [[ "$BUILD_RESULT" == "success" && "$UPLOAD_RESULT" == "success" ]]; then
+            STATUS="success"
+            TITLE_EMOJI="🚀"
+            TITLE_LABEL="New Release"
+            EMBED_COLOR=3066993   # green
+          elif [[ "$BUILD_RESULT" == "cancelled" || "$UPLOAD_RESULT" == "cancelled" ]]; then
+            STATUS="cancelled"
+            TITLE_EMOJI="🚫"
+            TITLE_LABEL="Release Cancelled"
+            EMBED_COLOR=9807270   # grey
+          else
+            STATUS="failure"
+            TITLE_EMOJI="❌"
+            TITLE_LABEL="Release Failed"
+            EMBED_COLOR=15158332  # red
+          fi
+
+          # Proxy download page: https://download.stemlabs.site/<repo>/<tag>/<versionCode> (APK/AAB in UI)
+          REPO_NAME="${GITHUB_REPOSITORY##*/}"
+          PORTAL_BASE="${DOWNLOAD_PORTAL_BASE:-https://download.stemlabs.site}"
+          PORTAL_BASE="${PORTAL_BASE%/}"
+          PORTAL_URL="${PORTAL_BASE}/${REPO_NAME}/${TAG_NAME}/${VERSION_CODE}"
+          if [[ "$STATUS" == "success" ]]; then
+            LINKS_VALUE="[📥 Open download page](${PORTAL_URL})"
+          else
+            LINKS_VALUE="*(unavailable — build ${BUILD_RESULT} / upload ${UPLOAD_RESULT})*"
+          fi
+
+          COMMITS_TEXT="$COMMITS_RAW"
+          COMMITS_COUNT=$(echo "$COMMITS_TEXT" | grep -c "^-" || echo "0")
+          if [ ${#COMMITS_TEXT} -gt 900 ] || [ "$COMMITS_COUNT" -gt 15 ]; then
+            COMMITS_TEXT=$(echo "$COMMITS_TEXT" | head -15)
+            COMMITS_TEXT="${COMMITS_TEXT}\n... (and more)"
+          fi
+          COMMITS_ESCAPED=$(echo "$COMMITS_TEXT" | head -c 1000 | jq -Rs .)
+
+          PAYLOAD=$(jq -n \
+            --arg content "$USER_TAGS" \
+            --arg tag_name "${{ github.ref_name }}" \
+            --arg version_name "$VERSION_NAME" \
+            --arg version_code "$VERSION_CODE" \
+            --arg actor "${{ github.actor }}" \
+            --arg title_emoji "$TITLE_EMOJI" \
+            --arg title_label "$TITLE_LABEL" \
+            --argjson embed_color "$EMBED_COLOR" \
+            --arg links_value "$LINKS_VALUE" \
+            --argjson commits "$COMMITS_ESCAPED" \
+            --arg run_url "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            --arg repo_name "${{ github.repository }}" \
+            --arg timestamp "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            '{
+              content: $content,
+              embeds: [{
+                title: ($title_emoji + " " + $title_label + ": " + $tag_name),
+                url: $run_url,
+                color: $embed_color,
+                fields: [
+                  {
+                    name: "📱 App Version",
+                    value: ("**" + $version_name + "** (Code: " + $version_code + ")"),
+                    inline: true
+                  },
+                  {
+                    name: "👤 Built By",
+                    value: $actor,
+                    inline: true
+                  },
+                  {
+                    name: "📦 Downloads",
+                    value: $links_value,
+                    inline: false
+                  },
+                  {
+                    name: "📝 Changes",
+                    value: ("```\n" + $commits + "\n```"),
+                    inline: false
+                  }
+                ],
+                footer: {
+                  text: ("GitHub Release • " + $repo_name)
+                },
+                timestamp: $timestamp
+              }]
+            }')
+
+          curl -X POST "$DISCORD_WEBHOOK_URL" \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD"
+
+      - name: Post Play Deploy button (via bot)
+        if: needs.build.result == 'success' && needs.upload_and_release.result == 'success'
+        env:
+          PLAY_DEPLOY_BOT_URL: ${{ secrets.PLAY_DEPLOY_BOT_URL }}
+          PLAY_DEPLOY_NOTIFY_TOKEN: ${{ secrets.PLAY_DEPLOY_NOTIFY_TOKEN }}
+          DOWNLOAD_PORTAL_BASE: ${{ vars.DOWNLOAD_PORTAL_BASE || 'https://download.stemlabs.site' }}
+        run: |
+          if [ -z "$PLAY_DEPLOY_BOT_URL" ] || [ -z "$PLAY_DEPLOY_NOTIFY_TOKEN" ]; then
+            echo "PLAY_DEPLOY_BOT_URL or PLAY_DEPLOY_NOTIFY_TOKEN not set. Skipping deploy button."
+            exit 0
+          fi
+          REPO_NAME="${GITHUB_REPOSITORY##*/}"
+          PORTAL_BASE="${DOWNLOAD_PORTAL_BASE:-https://download.stemlabs.site}"
+          PORTAL_BASE="${PORTAL_BASE%/}"
+          PORTAL_URL="${PORTAL_BASE}/${REPO_NAME}/${{ github.ref_name }}/${{ steps.version_info.outputs.VERSION_CODE }}"
+          BODY=$(jq -n \
+            --arg repo "${{ github.repository }}" \
+            --arg tag "${{ github.ref_name }}" \
+            --arg version_name "${{ steps.version_info.outputs.VERSION_NAME }}" \
+            --arg version_code "${{ steps.version_info.outputs.VERSION_CODE }}" \
+            --arg actor "${{ github.actor }}" \
+            --arg download_url "$PORTAL_URL" \
+            --arg run_url "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            '{
+              repo: $repo,
+              tag: $tag,
+              versionName: $version_name,
+              versionCode: $version_code,
+              actor: $actor,
+              downloadUrl: $download_url,
+              runUrl: $run_url
+            }')
+          curl -fsS -X POST "${PLAY_DEPLOY_BOT_URL%/}/notify" \
+            -H "Authorization: Bearer $PLAY_DEPLOY_NOTIFY_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "$BODY"

@@ -1,0 +1,546 @@
+name: Build Test/RC APKs & AABs
+
+permissions:
+  contents: write
+
+on:
+  push:
+    tags:
+      - '*-test'
+      - '*-rc'
+
+jobs:
+  build:
+    runs-on: [self-hosted, ubuntu32]
+    outputs:
+      tag_name: ${{ steps.build_type.outputs.TAG_NAME }}
+      build_env: ${{ steps.build_type.outputs.BUILD_ENV }}
+      build_type: ${{ steps.build_type.outputs.BUILD_TYPE }}
+      build_type_lower: ${{ steps.build_type.outputs.BUILD_TYPE_LOWER }}
+
+    env:
+      RELEASE_STORE_FILE: ${{ github.workspace }}/app/keystore.jks
+      RELEASE_STORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+      RELEASE_KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+      RELEASE_KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+      # settings.gradle.kts reads GITHUB_ACTOR / GITHUB_TOKEN (NV_* kept as legacy fallback)
+      GITHUB_ACTOR: ${{ secrets.GITHUB_ACTOR || secrets.NV_ACTOR || github.actor }}
+      GITHUB_TOKEN: ${{ secrets.GH_PACKAGES_TOKEN || secrets.NV_TOKEN || github.token }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          # Default also installs 'tools', which the SDK repo no longer provides (sdkmanager exits 1).
+          packages: 'platform-tools'
+
+      - name: Grant execute permission for gradlew
+        run: chmod +x gradlew
+
+      - name: Prepare Gradle (self-hosted)
+        run: |
+          ./gradlew --stop 2>/dev/null || true
+          if [ -d "$HOME/.gradle/caches" ]; then
+            find "$HOME/.gradle/caches" -mindepth 2 -maxdepth 2 -type d -name transforms -prune -exec rm -rf {} +
+          fi
+
+      - name: Determine build type
+        id: build_type
+        run: |
+          TAG="${GITHUB_REF#refs/tags/}"
+          echo "TAG_NAME=$TAG" >> $GITHUB_OUTPUT
+
+          if [[ "$TAG" == *-test ]]; then
+            echo "BUILD_ENV=test" >> $GITHUB_OUTPUT
+            echo "BUILD_TYPE=Debug" >> $GITHUB_OUTPUT
+            echo "BUILD_TYPE_LOWER=debug" >> $GITHUB_OUTPUT
+          elif [[ "$TAG" == *-rc ]]; then
+            echo "BUILD_ENV=rc" >> $GITHUB_OUTPUT
+            echo "BUILD_TYPE=Release" >> $GITHUB_OUTPUT
+            echo "BUILD_TYPE_LOWER=release" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Setup Keystore
+        if: steps.build_type.outputs.BUILD_ENV == 'rc'
+        run: |
+          echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 -d > app/keystore.jks
+          echo "Keystore file created"
+          ls -lh app/keystore.jks
+
+      - name: Setup google-services.json
+        run: |
+          set -euo pipefail
+          if [ -z "${{ secrets.GOOGLE_SERVICES_JSON_BASE64 }}" ]; then
+            echo "::error::Secret GOOGLE_SERVICES_JSON_BASE64 is empty. Encode PRODUCTION app/google-services.json (scripts/gen-env-base64.sh) and push via scripts/push-secret.sh. Org secrets do not include this — it is per-app."
+            exit 1
+          fi
+          echo "${{ secrets.GOOGLE_SERVICES_JSON_BASE64 }}" | base64 -d > app/google-services.json
+          echo "google-services.json created"
+          ls -lh app/google-services.json
+
+      - name: Build Organic APK
+        run: |
+          BT="${{ steps.build_type.outputs.BUILD_TYPE }}"
+          ./gradlew :app:assembleOrganic${BT} --build-cache --parallel --no-daemon --no-configuration-cache
+
+      - name: Build Campaign APK
+        run: |
+          BT="${{ steps.build_type.outputs.BUILD_TYPE }}"
+          ./gradlew :app:assembleCampaign${BT} --build-cache --parallel --no-daemon --no-configuration-cache
+
+      - name: Build Review APK
+        run: |
+          BT="${{ steps.build_type.outputs.BUILD_TYPE }}"
+          ./gradlew :app:assembleReview${BT} --build-cache --parallel --no-daemon --no-configuration-cache
+
+      - name: Build Organic App Bundle (AAB)
+        if: steps.build_type.outputs.BUILD_ENV == 'rc'
+        run: |
+          BT="${{ steps.build_type.outputs.BUILD_TYPE }}"
+          ./gradlew :app:bundleOrganic${BT} --build-cache --parallel --no-daemon --no-configuration-cache
+
+      - name: Build Campaign App Bundle (AAB)
+        if: steps.build_type.outputs.BUILD_ENV == 'rc'
+        run: |
+          BT="${{ steps.build_type.outputs.BUILD_TYPE }}"
+          ./gradlew :app:bundleCampaign${BT} --build-cache --parallel --no-daemon --no-configuration-cache
+
+      - name: Build Review App Bundle (AAB)
+        if: steps.build_type.outputs.BUILD_ENV == 'rc'
+        run: |
+          BT="${{ steps.build_type.outputs.BUILD_TYPE }}"
+          ./gradlew :app:bundleReview${BT} --build-cache --parallel --no-daemon --no-configuration-cache
+
+      - name: Cleanup secrets on disk
+        if: always()
+        run: |
+          rm -f app/keystore.jks app/google-services.json
+          echo "Keystore and google-services.json removed for security"
+
+      - name: Collect outputs to local tmp
+        id: collect
+        run: |
+          set -euo pipefail
+          BT="${{ steps.build_type.outputs.BUILD_TYPE }}"
+          BT_LOWER="${{ steps.build_type.outputs.BUILD_TYPE_LOWER }}"
+          BUILD_ENV="${{ steps.build_type.outputs.BUILD_ENV }}"
+          TAG_NAME="${{ steps.build_type.outputs.TAG_NAME }}"
+          REPO_NAME="${{ github.event.repository.name }}"
+          TAG_SAFE=$(printf '%s' "$TAG_NAME" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9._-]/_/g')
+          REPO_SAFE=$(printf '%s' "$REPO_NAME" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9._-]/_/g')
+          DIST_DIR="/tmp/gh-dist-${{ github.run_id }}"
+          mkdir -p "${DIST_DIR}/apk" "${DIST_DIR}/bundle"
+
+          for flavor in organic campaign review; do
+            base="${REPO_SAFE}_${flavor}_${TAG_SAFE}"
+            APK_DIR="app/build/outputs/apk/${flavor}/${BT_LOWER}"
+            APK=$(find "$APK_DIR" -name "*.apk" -type f | head -1)
+            if [ -z "$APK" ]; then
+              echo "${flavor} APK not found under $APK_DIR"
+              exit 1
+            fi
+            cp "$APK" "${DIST_DIR}/apk/${base}.apk"
+            echo "Collected ${flavor} APK: $APK -> ${DIST_DIR}/apk/${base}.apk"
+
+            if [[ "$BUILD_ENV" == "rc" ]]; then
+              BUNDLE_DIR="app/build/outputs/bundle/${flavor}${BT}"
+              AAB=$(find "$BUNDLE_DIR" -name "*.aab" -type f | head -1)
+              if [ -z "$AAB" ]; then
+                echo "${flavor} AAB not found under $BUNDLE_DIR"
+                exit 1
+              fi
+              cp "$AAB" "${DIST_DIR}/bundle/${base}.aab"
+              echo "Collected ${flavor} AAB: $AAB -> ${DIST_DIR}/bundle/${base}.aab"
+            fi
+          done
+
+          ls -laR "${DIST_DIR}"
+
+  upload_and_release:
+    needs: build
+    runs-on: [self-hosted, ubuntu32]
+    if: needs.build.result == 'success'
+    outputs:
+      organic_apk_url: ${{ steps.upload_organic_apk.outputs.APK_URL }}
+      campaign_apk_url: ${{ steps.upload_campaign_apk.outputs.APK_URL }}
+      review_apk_url: ${{ steps.upload_review_apk.outputs.APK_URL }}
+      organic_aab_url: ${{ steps.upload_organic_aab.outputs.AAB_URL }}
+      campaign_aab_url: ${{ steps.upload_campaign_aab.outputs.AAB_URL }}
+      review_aab_url: ${{ steps.upload_review_aab.outputs.AAB_URL }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: "Set artifact basename env (repo_flavor_tag)"
+        run: |
+          TAG_NAME="${{ needs.build.outputs.tag_name }}"
+          REPO_NAME="${{ github.event.repository.name }}"
+          TAG_SAFE=$(printf '%s' "$TAG_NAME" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9._-]/_/g')
+          REPO_SAFE=$(printf '%s' "$REPO_NAME" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9._-]/_/g')
+          {
+            echo "TAG_SAFE=$TAG_SAFE"
+            echo "REPO_SAFE=$REPO_SAFE"
+          } >> "$GITHUB_ENV"
+
+      - name: Verify local dist exists
+        run: |
+          DIST_DIR="/tmp/gh-dist-${{ github.run_id }}"
+          missing=0
+          for flavor in organic campaign review; do
+            f="${DIST_DIR}/apk/${REPO_SAFE}_${flavor}_${TAG_SAFE}.apk"
+            if [ ! -f "$f" ]; then
+              echo "ERROR: missing $f"
+              missing=1
+            fi
+          done
+          if [ "$missing" -eq 1 ]; then
+            ls -laR "${DIST_DIR}" 2>/dev/null || echo "(directory missing)"
+            exit 1
+          fi
+          echo "dist OK:"
+          ls -lh "${DIST_DIR}/apk/"
+          ls -lh "${DIST_DIR}/bundle/" 2>/dev/null || true
+
+      - name: Delete existing GitHub release for tag (required before create)
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          TAG_NAME: ${{ needs.build.outputs.tag_name }}
+        run: bash scripts/gh_delete_release_for_tag.sh
+
+      - name: Upload Organic APK to Nexus
+        id: upload_organic_apk
+        env:
+          NEXUS_URL: ${{ secrets.NEXUS_URL }}
+          NEXUS_USER: ${{ secrets.NEXUS_USER }}
+          NEXUS_PASS: ${{ secrets.NEXUS_PASS }}
+          NEXUS_RAW_REPO: ${{ secrets.NEXUS_RAW_REPO }}
+        run: |
+          set -euo pipefail
+          TAG="${{ needs.build.outputs.tag_name }}"
+          REPO_NAME="${GITHUB_REPOSITORY##*/}"
+          APK_SRC="/tmp/gh-dist-${{ github.run_id }}/apk/${REPO_SAFE}_organic_${TAG_SAFE}.apk"
+          APK_NAME="$(basename "$APK_SRC")"
+          APK_URL="${NEXUS_URL%/}/repository/${NEXUS_RAW_REPO}/android/${REPO_NAME}/${TAG}/${APK_NAME}"
+          curl -f --retry 3 --retry-delay 2 \
+            -u "${NEXUS_USER}:${NEXUS_PASS}" \
+            --upload-file "$APK_SRC" \
+            "$APK_URL"
+          echo "APK_URL=$APK_URL" >> $GITHUB_OUTPUT
+
+      - name: Upload Campaign APK to Nexus
+        id: upload_campaign_apk
+        env:
+          NEXUS_URL: ${{ secrets.NEXUS_URL }}
+          NEXUS_USER: ${{ secrets.NEXUS_USER }}
+          NEXUS_PASS: ${{ secrets.NEXUS_PASS }}
+          NEXUS_RAW_REPO: ${{ secrets.NEXUS_RAW_REPO }}
+        run: |
+          set -euo pipefail
+          TAG="${{ needs.build.outputs.tag_name }}"
+          REPO_NAME="${GITHUB_REPOSITORY##*/}"
+          APK_SRC="/tmp/gh-dist-${{ github.run_id }}/apk/${REPO_SAFE}_campaign_${TAG_SAFE}.apk"
+          APK_NAME="$(basename "$APK_SRC")"
+          APK_URL="${NEXUS_URL%/}/repository/${NEXUS_RAW_REPO}/android/${REPO_NAME}/${TAG}/${APK_NAME}"
+          curl -f --retry 3 --retry-delay 2 \
+            -u "${NEXUS_USER}:${NEXUS_PASS}" \
+            --upload-file "$APK_SRC" \
+            "$APK_URL"
+          echo "APK_URL=$APK_URL" >> $GITHUB_OUTPUT
+
+      - name: Upload Review APK to Nexus
+        id: upload_review_apk
+        env:
+          NEXUS_URL: ${{ secrets.NEXUS_URL }}
+          NEXUS_USER: ${{ secrets.NEXUS_USER }}
+          NEXUS_PASS: ${{ secrets.NEXUS_PASS }}
+          NEXUS_RAW_REPO: ${{ secrets.NEXUS_RAW_REPO }}
+        run: |
+          set -euo pipefail
+          TAG="${{ needs.build.outputs.tag_name }}"
+          REPO_NAME="${GITHUB_REPOSITORY##*/}"
+          APK_SRC="/tmp/gh-dist-${{ github.run_id }}/apk/${REPO_SAFE}_review_${TAG_SAFE}.apk"
+          APK_NAME="$(basename "$APK_SRC")"
+          APK_URL="${NEXUS_URL%/}/repository/${NEXUS_RAW_REPO}/android/${REPO_NAME}/${TAG}/${APK_NAME}"
+          curl -f --retry 3 --retry-delay 2 \
+            -u "${NEXUS_USER}:${NEXUS_PASS}" \
+            --upload-file "$APK_SRC" \
+            "$APK_URL"
+          echo "APK_URL=$APK_URL" >> $GITHUB_OUTPUT
+
+      - name: Upload Organic AAB to Nexus
+        id: upload_organic_aab
+        if: needs.build.outputs.build_env == 'rc'
+        env:
+          NEXUS_URL: ${{ secrets.NEXUS_URL }}
+          NEXUS_USER: ${{ secrets.NEXUS_USER }}
+          NEXUS_PASS: ${{ secrets.NEXUS_PASS }}
+          NEXUS_RAW_REPO: ${{ secrets.NEXUS_RAW_REPO }}
+        run: |
+          set -euo pipefail
+          TAG="${{ needs.build.outputs.tag_name }}"
+          REPO_NAME="${GITHUB_REPOSITORY##*/}"
+          AAB_SRC="/tmp/gh-dist-${{ github.run_id }}/bundle/${REPO_SAFE}_organic_${TAG_SAFE}.aab"
+          AAB_NAME="$(basename "$AAB_SRC")"
+          AAB_URL="${NEXUS_URL%/}/repository/${NEXUS_RAW_REPO}/android/${REPO_NAME}/${TAG}/${AAB_NAME}"
+          curl -f --retry 3 --retry-delay 2 \
+            -u "${NEXUS_USER}:${NEXUS_PASS}" \
+            --upload-file "$AAB_SRC" \
+            "$AAB_URL"
+          echo "AAB_URL=$AAB_URL" >> $GITHUB_OUTPUT
+
+      - name: Upload Campaign AAB to Nexus
+        id: upload_campaign_aab
+        if: needs.build.outputs.build_env == 'rc'
+        env:
+          NEXUS_URL: ${{ secrets.NEXUS_URL }}
+          NEXUS_USER: ${{ secrets.NEXUS_USER }}
+          NEXUS_PASS: ${{ secrets.NEXUS_PASS }}
+          NEXUS_RAW_REPO: ${{ secrets.NEXUS_RAW_REPO }}
+        run: |
+          set -euo pipefail
+          TAG="${{ needs.build.outputs.tag_name }}"
+          REPO_NAME="${GITHUB_REPOSITORY##*/}"
+          AAB_SRC="/tmp/gh-dist-${{ github.run_id }}/bundle/${REPO_SAFE}_campaign_${TAG_SAFE}.aab"
+          AAB_NAME="$(basename "$AAB_SRC")"
+          AAB_URL="${NEXUS_URL%/}/repository/${NEXUS_RAW_REPO}/android/${REPO_NAME}/${TAG}/${AAB_NAME}"
+          curl -f --retry 3 --retry-delay 2 \
+            -u "${NEXUS_USER}:${NEXUS_PASS}" \
+            --upload-file "$AAB_SRC" \
+            "$AAB_URL"
+          echo "AAB_URL=$AAB_URL" >> $GITHUB_OUTPUT
+
+      - name: Upload Review AAB to Nexus
+        id: upload_review_aab
+        if: needs.build.outputs.build_env == 'rc'
+        env:
+          NEXUS_URL: ${{ secrets.NEXUS_URL }}
+          NEXUS_USER: ${{ secrets.NEXUS_USER }}
+          NEXUS_PASS: ${{ secrets.NEXUS_PASS }}
+          NEXUS_RAW_REPO: ${{ secrets.NEXUS_RAW_REPO }}
+        run: |
+          set -euo pipefail
+          TAG="${{ needs.build.outputs.tag_name }}"
+          REPO_NAME="${GITHUB_REPOSITORY##*/}"
+          AAB_SRC="/tmp/gh-dist-${{ github.run_id }}/bundle/${REPO_SAFE}_review_${TAG_SAFE}.aab"
+          AAB_NAME="$(basename "$AAB_SRC")"
+          AAB_URL="${NEXUS_URL%/}/repository/${NEXUS_RAW_REPO}/android/${REPO_NAME}/${TAG}/${AAB_NAME}"
+          curl -f --retry 3 --retry-delay 2 \
+            -u "${NEXUS_USER}:${NEXUS_PASS}" \
+            --upload-file "$AAB_SRC" \
+            "$AAB_URL"
+          echo "AAB_URL=$AAB_URL" >> $GITHUB_OUTPUT
+
+      - name: Create GitHub Pre-Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.build.outputs.tag_name }}
+          name: "${{ needs.build.outputs.build_env == 'rc' && 'RC' || 'Test' }} Build ${{ needs.build.outputs.tag_name }}"
+          body: |
+            **${{ needs.build.outputs.build_env == 'rc' && 'Release Candidate' || 'Test (Debug)' }}** build for tag `${{ needs.build.outputs.tag_name }}`.
+
+            ### Nexus — APK
+            - Organic: ${{ steps.upload_organic_apk.outputs.APK_URL }}
+            - Campaign: ${{ steps.upload_campaign_apk.outputs.APK_URL }}
+            - Review: ${{ steps.upload_review_apk.outputs.APK_URL }}
+
+            ${{ needs.build.outputs.build_env == 'rc' && format('### Nexus — App Bundle (AAB)\n- Organic: {0}\n- Campaign: {1}\n- Review: {2}', steps.upload_organic_aab.outputs.AAB_URL, steps.upload_campaign_aab.outputs.AAB_URL, steps.upload_review_aab.outputs.AAB_URL) || '_AAB not built for test tags._' }}
+          draft: false
+          prerelease: true
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+
+      - name: Cleanup local tmp dist
+        if: always()
+        run: rm -rf "/tmp/gh-dist-${{ github.run_id }}"
+
+  notify_discord:
+    needs:
+      - build
+      - upload_and_release
+    runs-on: [self-hosted, ubuntu32]
+    if: always()
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Extract version info
+        id: version_info
+        run: |
+          VERSION_NAME=$(grep -E '^[[:space:]]*versionName[[:space:]]*=' app/build.gradle.kts | head -1 | sed -E 's/.*versionName[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/')
+          VERSION_CODE=$(grep -E '^[[:space:]]*versionCode[[:space:]]*=' app/build.gradle.kts | head -1 | sed -E 's/.*versionCode[[:space:]]*=[[:space:]]*([0-9]+).*/\1/')
+          echo "VERSION_NAME=$VERSION_NAME" >> $GITHUB_OUTPUT
+          echo "VERSION_CODE=$VERSION_CODE" >> $GITHUB_OUTPUT
+
+      - name: Get commit list
+        id: commit_list
+        run: |
+          git fetch --tags --force
+          TAG="${{ needs.build.outputs.tag_name }}"
+          PREV_TAG=$(git tag --sort=-version:refname | grep -v "^${TAG}$" | head -1 || echo "")
+          if [ -z "$PREV_TAG" ]; then
+            COMMITS=$(git log --pretty=format:"- %s (%h)" --no-merges HEAD)
+          else
+            COMMITS=$(git log ${PREV_TAG}..HEAD --pretty=format:"- %s (%h)" --no-merges)
+          fi
+          if [ -z "$COMMITS" ]; then
+            COMMITS="No commits found"
+          fi
+          {
+            echo "COMMITS<<EOF"
+            echo "$COMMITS"
+            echo "EOF"
+          } >> $GITHUB_OUTPUT
+
+      - name: Format Discord user tags
+        id: discord_tags
+        env:
+          DISCORD_USER_IDS: ${{ vars.DISCORD_USER_IDS || secrets.DISCORD_USER_IDS }}
+        run: |
+          if [ -z "$DISCORD_USER_IDS" ]; then
+            echo "USER_TAGS=" >> $GITHUB_OUTPUT
+          else
+            TAGS=$(echo "$DISCORD_USER_IDS" | tr ',' '\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | sed 's/^/<@/' | sed 's/$/>/' | tr '\n' ' ')
+            echo "USER_TAGS=$TAGS" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Send Discord notification
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          BUILD_RESULT: ${{ needs.build.result }}
+          UPLOAD_RESULT: ${{ needs.upload_and_release.result }}
+          BUILD_ENV: ${{ needs.build.outputs.build_env }}
+          TAG_NAME: ${{ needs.build.outputs.tag_name }}
+          # Public download UI (not Nexus). Override via repo var DOWNLOAD_PORTAL_BASE.
+          DOWNLOAD_PORTAL_BASE: ${{ vars.DOWNLOAD_PORTAL_BASE || 'https://download.stemlabs.site' }}
+          USER_TAGS: ${{ steps.discord_tags.outputs.USER_TAGS }}
+          VERSION_NAME: ${{ steps.version_info.outputs.VERSION_NAME }}
+          VERSION_CODE: ${{ steps.version_info.outputs.VERSION_CODE }}
+          COMMITS_RAW: ${{ steps.commit_list.outputs.COMMITS }}
+        run: |
+          if [ -z "$DISCORD_WEBHOOK_URL" ]; then
+            echo "DISCORD_WEBHOOK_URL not set. Skipping Discord notification."
+            exit 0
+          fi
+
+          # Determine overall status first
+          if [[ "$BUILD_RESULT" == "success" && "$UPLOAD_RESULT" == "success" ]]; then
+            STATUS="success"
+          elif [[ "$BUILD_RESULT" == "cancelled" || "$UPLOAD_RESULT" == "cancelled" ]]; then
+            STATUS="cancelled"
+          else
+            STATUS="failure"
+          fi
+
+          # Set title/color based on build type × status
+          if [[ "$STATUS" == "success" ]]; then
+            if [ "$BUILD_ENV" = "rc" ]; then
+              TITLE_EMOJI="🏗️"
+              TITLE_LABEL="Release Candidate"
+              EMBED_COLOR=15105570  # orange
+            else
+              TITLE_EMOJI="🧪"
+              TITLE_LABEL="Test Build (Debug)"
+              EMBED_COLOR=3447003   # blue
+            fi
+          elif [[ "$STATUS" == "cancelled" ]]; then
+            TITLE_EMOJI="🚫"
+            TITLE_LABEL="${BUILD_ENV} Build Cancelled"
+            EMBED_COLOR=9807270    # grey
+          else
+            TITLE_EMOJI="❌"
+            TITLE_LABEL="${BUILD_ENV} Build Failed"
+            EMBED_COLOR=15158332   # red
+          fi
+
+          # Proxy page: /<rc|test>/<repo>/<tag>/<versionCode>/ — APK/AAB grouped per build (matches UI filenames).
+          REPO_NAME="${GITHUB_REPOSITORY##*/}"
+          PORTAL_BASE="${DOWNLOAD_PORTAL_BASE:-https://download.stemlabs.site}"
+          PORTAL_BASE="${PORTAL_BASE%/}"
+          if [ "$BUILD_ENV" = "rc" ]; then
+            PORTAL_URL="${PORTAL_BASE}/rc/${REPO_NAME}/${TAG_NAME}/${VERSION_CODE}"
+            PORTAL_HINT="RC: APK + AAB (organic, campaign, review) on the download page."
+          else
+            PORTAL_URL="${PORTAL_BASE}/test/${REPO_NAME}/${TAG_NAME}/${VERSION_CODE}"
+            PORTAL_HINT="Test: Debug APKs on the download page. (AAB is RC-only.)"
+          fi
+          if [[ "$STATUS" == "success" ]]; then
+            # Single-line assign so YAML | block does not parse the newline as a new key
+            LINKS_VALUE=$(printf '%s\n%s' "[📥 Open download page](${PORTAL_URL})" "$PORTAL_HINT")
+          else
+            LINKS_VALUE="*(unavailable — build ${BUILD_RESULT} / upload ${UPLOAD_RESULT})*"
+          fi
+
+          COMMITS_TEXT="$COMMITS_RAW"
+          COMMITS_COUNT=$(echo "$COMMITS_TEXT" | grep -c "^-" || echo "0")
+          if [ ${#COMMITS_TEXT} -gt 900 ] || [ "$COMMITS_COUNT" -gt 15 ]; then
+            COMMITS_TEXT=$(echo "$COMMITS_TEXT" | head -15)
+            COMMITS_TEXT="${COMMITS_TEXT}\n... (and more)"
+          fi
+          COMMITS_ESCAPED=$(echo "$COMMITS_TEXT" | head -c 1000 | jq -Rs .)
+
+          PAYLOAD=$(jq -n \
+            --arg content "$USER_TAGS" \
+            --arg tag_name "$TAG_NAME" \
+            --arg version_name "$VERSION_NAME" \
+            --arg version_code "$VERSION_CODE" \
+            --arg actor "${{ github.actor }}" \
+            --arg title_emoji "$TITLE_EMOJI" \
+            --arg title_label "$TITLE_LABEL" \
+            --argjson embed_color "$EMBED_COLOR" \
+            --arg links_value "$LINKS_VALUE" \
+            --argjson commits "$COMMITS_ESCAPED" \
+            --arg run_url "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            --arg repo_name "${{ github.repository }}" \
+            --arg timestamp "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            '{
+              content: $content,
+              embeds: [{
+                title: ($title_emoji + " " + $title_label + ": " + $tag_name),
+                url: $run_url,
+                color: $embed_color,
+                fields: [
+                  {
+                    name: "📱 App Version",
+                    value: ("**" + $version_name + "** (Code: " + $version_code + ")"),
+                    inline: true
+                  },
+                  {
+                    name: "👤 Built By",
+                    value: $actor,
+                    inline: true
+                  },
+                  {
+                    name: "📦 Downloads",
+                    value: $links_value,
+                    inline: false
+                  },
+                  {
+                    name: "📝 Changes",
+                    value: ("```\n" + $commits + "\n```"),
+                    inline: false
+                  }
+                ],
+                footer: {
+                  text: ("GitHub Pre-Release • " + $repo_name)
+                },
+                timestamp: $timestamp
+              }]
+            }')
+
+          curl -X POST "$DISCORD_WEBHOOK_URL" \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD"

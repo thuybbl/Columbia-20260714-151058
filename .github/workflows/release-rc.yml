@@ -1,0 +1,261 @@
+name: Release Candidate Notification
+
+permissions:
+  contents: read
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: 'Tag name (e.g., v1.0.6-rc)'
+        required: true
+        type: string
+      build_type:
+        description: 'Build type (RC, TEST, QA)'
+        required: false
+        default: 'RC'
+        type: string
+
+jobs:
+  notify:
+    runs-on: [self-hosted, ubuntu32]
+    
+    steps:
+      - name: Get tag name
+        id: tag
+        run: echo "TAG_NAME=${{ github.event.inputs.tag_name }}" >> $GITHUB_OUTPUT
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag_name }}
+          fetch-depth: 0  # Fetch full history for commit list
+
+      - name: Extract version info
+        id: version_info
+        run: |
+          VERSION_NAME=$(grep -E '^[[:space:]]*versionName[[:space:]]*=' app/build.gradle.kts | head -1 | sed -E 's/.*versionName[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/')
+          VERSION_CODE=$(grep -E '^[[:space:]]*versionCode[[:space:]]*=' app/build.gradle.kts | head -1 | sed -E 's/.*versionCode[[:space:]]*=[[:space:]]*([0-9]+).*/\1/')
+          echo "VERSION_NAME=$VERSION_NAME" >> $GITHUB_OUTPUT
+          echo "VERSION_CODE=$VERSION_CODE" >> $GITHUB_OUTPUT
+          echo "Version: $VERSION_NAME (Code: $VERSION_CODE)"
+
+      - name: Get commit list
+        id: commit_list
+        run: |
+          # Fetch all tags to ensure we have the full history
+          git fetch --tags --force
+          
+          # Get previous tag (excluding current tag and other RC tags)
+          PREV_TAG=$(git tag --sort=-version:refname | grep -v -- "-rc$" | grep -v "^${{ steps.tag.outputs.TAG_NAME }}$" | head -1 || echo "")
+          
+          if [ -z "$PREV_TAG" ]; then
+            # If no previous tag, get all commits up to current tag
+            COMMITS=$(git log --pretty=format:"- %s (%h)" --no-merges ${{ steps.tag.outputs.TAG_NAME }})
+          else
+            # Get commits between previous tag and current tag
+            COMMITS=$(git log ${PREV_TAG}..${{ steps.tag.outputs.TAG_NAME }} --pretty=format:"- %s (%h)" --no-merges)
+          fi
+          
+          # Use multiline output for GitHub Actions
+          {
+            echo "COMMITS<<EOF"
+            echo "$COMMITS"
+            echo "EOF"
+          } >> $GITHUB_OUTPUT
+          
+          if [ -z "$COMMITS" ]; then
+            {
+              echo "COMMITS<<EOF"
+              echo "No commits found"
+              echo "EOF"
+            } >> $GITHUB_OUTPUT
+          fi
+
+      - name: Get Nexus links from release
+        id: download_links
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${{ steps.tag.outputs.TAG_NAME }}"
+          RELEASE_JSON=$(curl -fsS -H "Authorization: Bearer $GITHUB_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/releases/tags/${TAG}" || true)
+          RELEASE_BODY=$(echo "$RELEASE_JSON" | jq -r '.body // ""')
+
+          # CI bodies (test-rc-build / build-release) use:
+          #   ### Nexus — APK
+          #   - Organic: <url> | - Campaign: | - Review: | - Prod:
+          #   ### Nexus — App Bundle (AAB)
+          #   - Organic: <url> | ...  (same labels again under AAB section)
+          # Legacy: "- Organic APK (Nexus):", "- APK (Nexus):"
+          extract_nth() {
+            local label="$1"
+            local n="${2:-1}"
+            echo "$RELEASE_BODY" | sed -nE "s/^-[[:space:]]*${label}[[:space:]]*:[[:space:]]*(https?:\/\/[^[:space:]]+).*/\1/p" | sed -n "${n}p"
+          }
+
+          APK_URL=$(extract_nth "APK \\(Nexus\\)" 1)
+          [ -z "$APK_URL" ] && APK_URL=$(extract_nth "Prod" 1)
+          AAB_URL=$(extract_nth "AAB \\(Nexus\\)" 1)
+          [ -z "$AAB_URL" ] && AAB_URL=$(extract_nth "Prod" 2)
+
+          ORGANIC_URL=$(extract_nth "Organic" 1)
+          [ -z "$ORGANIC_URL" ] && ORGANIC_URL=$(extract_nth "Organic APK \\(Nexus\\)" 1)
+          CAMPAIGN_URL=$(extract_nth "Campaign" 1)
+          [ -z "$CAMPAIGN_URL" ] && CAMPAIGN_URL=$(extract_nth "Campaign APK \\(Nexus\\)" 1)
+          REVIEW_URL=$(extract_nth "Review" 1)
+          [ -z "$REVIEW_URL" ] && REVIEW_URL=$(extract_nth "Review APK \\(Nexus\\)" 1)
+
+          # 2nd occurrence = AAB section when CI lists APK then AAB with same labels
+          ORGANIC_AAB_URL=$(extract_nth "Organic" 2)
+          CAMPAIGN_AAB_URL=$(extract_nth "Campaign" 2)
+          REVIEW_AAB_URL=$(extract_nth "Review" 2)
+
+          if [ -z "$APK_URL" ] && [ -z "$AAB_URL" ] && [ -z "$ORGANIC_URL" ] && [ -z "$CAMPAIGN_URL" ] && [ -z "$REVIEW_URL" ]; then
+            echo "No Nexus links found in release body for tag: $TAG"
+          fi
+          echo "APK_URL=$APK_URL" >> $GITHUB_OUTPUT
+          echo "AAB_URL=$AAB_URL" >> $GITHUB_OUTPUT
+          echo "ORGANIC_URL=$ORGANIC_URL" >> $GITHUB_OUTPUT
+          echo "CAMPAIGN_URL=$CAMPAIGN_URL" >> $GITHUB_OUTPUT
+          echo "REVIEW_URL=$REVIEW_URL" >> $GITHUB_OUTPUT
+          echo "ORGANIC_AAB_URL=$ORGANIC_AAB_URL" >> $GITHUB_OUTPUT
+          echo "CAMPAIGN_AAB_URL=$CAMPAIGN_AAB_URL" >> $GITHUB_OUTPUT
+          echo "REVIEW_AAB_URL=$REVIEW_AAB_URL" >> $GITHUB_OUTPUT
+
+      - name: Format Discord user tags
+        id: discord_tags
+        env:
+          DISCORD_USER_IDS: ${{ vars.DISCORD_USER_IDS || secrets.DISCORD_USER_IDS }}
+        run: |
+          if [ -z "$DISCORD_USER_IDS" ]; then
+            echo "USER_TAGS=" >> $GITHUB_OUTPUT
+          else
+            # Convert comma-separated IDs to Discord mention format
+            TAGS=$(echo "$DISCORD_USER_IDS" | tr ',' '\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | sed 's/^/<@/' | sed 's/$/>/' | tr '\n' ' ')
+            echo "USER_TAGS=$TAGS" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Send Discord notification
+        if: success()
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: |
+          if [ -z "$DISCORD_WEBHOOK_URL" ]; then
+            echo "DISCORD_WEBHOOK_URL not set. Skipping Discord notification."
+            exit 0
+          fi
+          
+          # Format commit list for Discord (limit to 15 commits, max 1000 chars for field value)
+          COMMITS_TEXT="${{ steps.commit_list.outputs.COMMITS }}"
+          COMMITS_COUNT=$(echo "$COMMITS_TEXT" | grep -c "^-" || echo "0")
+          
+          if [ ${#COMMITS_TEXT} -gt 900 ] || [ "$COMMITS_COUNT" -gt 15 ]; then
+            COMMITS_TEXT=$(echo "$COMMITS_TEXT" | head -15)
+            COMMITS_TEXT="${COMMITS_TEXT}\n... (and more)"
+          fi
+          
+          # Escape commits text for JSON (limit to 1000 chars for Discord field value)
+          COMMITS_ESCAPED=$(echo "$COMMITS_TEXT" | head -c 1000 | jq -Rs .)
+          
+          # Build Download Links text
+          DOWNLOAD_LINKS=""
+          if [ -n "${{ steps.download_links.outputs.APK_URL }}" ]; then
+            DOWNLOAD_LINKS="${DOWNLOAD_LINKS}[📱 APK](${{ steps.download_links.outputs.APK_URL }})"
+          fi
+          if [ -n "${{ steps.download_links.outputs.AAB_URL }}" ]; then
+            if [ -n "$DOWNLOAD_LINKS" ]; then DOWNLOAD_LINKS="${DOWNLOAD_LINKS}\n"; fi
+            DOWNLOAD_LINKS="${DOWNLOAD_LINKS}[📦 AAB](${{ steps.download_links.outputs.AAB_URL }})"
+          fi
+          if [ -n "${{ steps.download_links.outputs.ORGANIC_URL }}" ]; then
+            if [ -n "$DOWNLOAD_LINKS" ]; then DOWNLOAD_LINKS="${DOWNLOAD_LINKS}\n"; fi
+            DOWNLOAD_LINKS="${DOWNLOAD_LINKS}[📱 Organic APK](${{ steps.download_links.outputs.ORGANIC_URL }})"
+          fi
+          if [ -n "${{ steps.download_links.outputs.CAMPAIGN_URL }}" ]; then
+            if [ -n "$DOWNLOAD_LINKS" ]; then DOWNLOAD_LINKS="${DOWNLOAD_LINKS}\n"; fi
+            DOWNLOAD_LINKS="${DOWNLOAD_LINKS}[📱 Campaign APK](${{ steps.download_links.outputs.CAMPAIGN_URL }})"
+          fi
+          if [ -n "${{ steps.download_links.outputs.REVIEW_URL }}" ]; then
+            if [ -n "$DOWNLOAD_LINKS" ]; then DOWNLOAD_LINKS="${DOWNLOAD_LINKS}\n"; fi
+            DOWNLOAD_LINKS="${DOWNLOAD_LINKS}[📱 Review APK](${{ steps.download_links.outputs.REVIEW_URL }})"
+          fi
+          if [ -n "${{ steps.download_links.outputs.ORGANIC_AAB_URL }}" ]; then
+            if [ -n "$DOWNLOAD_LINKS" ]; then DOWNLOAD_LINKS="${DOWNLOAD_LINKS}\n"; fi
+            DOWNLOAD_LINKS="${DOWNLOAD_LINKS}[📦 Organic AAB](${{ steps.download_links.outputs.ORGANIC_AAB_URL }})"
+          fi
+          if [ -n "${{ steps.download_links.outputs.CAMPAIGN_AAB_URL }}" ]; then
+            if [ -n "$DOWNLOAD_LINKS" ]; then DOWNLOAD_LINKS="${DOWNLOAD_LINKS}\n"; fi
+            DOWNLOAD_LINKS="${DOWNLOAD_LINKS}[📦 Campaign AAB](${{ steps.download_links.outputs.CAMPAIGN_AAB_URL }})"
+          fi
+          if [ -n "${{ steps.download_links.outputs.REVIEW_AAB_URL }}" ]; then
+            if [ -n "$DOWNLOAD_LINKS" ]; then DOWNLOAD_LINKS="${DOWNLOAD_LINKS}\n"; fi
+            DOWNLOAD_LINKS="${DOWNLOAD_LINKS}[📦 Review AAB](${{ steps.download_links.outputs.REVIEW_AAB_URL }})"
+          fi
+          if [ -z "$DOWNLOAD_LINKS" ]; then
+            DOWNLOAD_LINKS="Nexus links unavailable for this tag."
+          fi
+          
+          # Determine Build Title and Color
+          BUILD_TYPE="${{ github.event.inputs.build_type }}"
+          TITLE="🚀 New Release Candidate"
+          COLOR=16776960 # Yellow for RC
+          
+          if [ "$BUILD_TYPE" = "TEST" ] || [ "$BUILD_TYPE" = "QA" ] || [ "$BUILD_TYPE" = "QC" ]; then
+            TITLE="🧪 New $BUILD_TYPE Build"
+            COLOR=3447003 # Blue for Test
+          fi
+          
+          # Build Discord payload with proper JSON escaping
+          PAYLOAD=$(jq -n \
+            --arg content "${{ steps.discord_tags.outputs.USER_TAGS }}" \
+            --arg title "$TITLE" \
+            --arg color "$COLOR" \
+            --arg tag_name "${{ steps.tag.outputs.TAG_NAME }}" \
+            --arg version_name "${{ steps.version_info.outputs.VERSION_NAME }}" \
+            --arg version_code "${{ steps.version_info.outputs.VERSION_CODE }}" \
+            --arg actor "${{ github.actor }}" \
+            --arg download_links "$DOWNLOAD_LINKS" \
+            --argjson commits "$COMMITS_ESCAPED" \
+            --arg run_url "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            --arg repo_name "${{ github.repository }}" \
+            --arg timestamp "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            '{
+              content: $content,
+              embeds: [{
+                title: ($title + ": " + $tag_name),
+                url: $run_url,
+                color: ($color | tonumber),
+                fields: [
+                  {
+                    name: "📱 App Version",
+                    value: ("**" + $version_name + "** (Code: " + $version_code + ")"),
+                    inline: true
+                  },
+                  {
+                    name: "👤 Built By",
+                    value: $actor,
+                    inline: true
+                  },
+                  {
+                    name: "📦 Download Links",
+                    value: $download_links,
+                    inline: false
+                  },
+                  {
+                    name: "📝 Changes",
+                    value: ("```\n" + $commits + "\n```"),
+                    inline: false
+                  }
+                ],
+                footer: {
+                  text: ("GitHub Build Notification • " + $repo_name)
+                },
+                timestamp: $timestamp
+              }]
+            }')
+          
+          # Send to Discord
+          curl -X POST "$DISCORD_WEBHOOK_URL" \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD"

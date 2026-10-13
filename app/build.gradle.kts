@@ -43,6 +43,32 @@ android {
         project.setProperty("archivesBaseName", formattedName)
     }
 
+    // [cicd.sh] Release signing — CI/local via env (RELEASE_*). Missing keystore → debug fallback.
+    signingConfigs {
+        create("release") {
+            val keystorePath = System.getenv("RELEASE_STORE_FILE")
+                ?: (project.findProperty("RELEASE_STORE_FILE") as? String)
+                ?: "keystore.jks"
+            val keystorePassword = System.getenv("RELEASE_STORE_PASSWORD")
+                ?: (project.findProperty("RELEASE_STORE_PASSWORD") as? String)
+                ?: "android"
+            val keyAliasName = System.getenv("RELEASE_KEY_ALIAS")
+                ?: (project.findProperty("RELEASE_KEY_ALIAS") as? String)
+                ?: "release"
+            val keyPasswordValue = System.getenv("RELEASE_KEY_PASSWORD")
+                ?: (project.findProperty("RELEASE_KEY_PASSWORD") as? String)
+                ?: keystorePassword
+            storeFile = if (keystorePath.startsWith("app/")) {
+                rootProject.file(keystorePath)
+            } else {
+                file(keystorePath)
+            }
+            storePassword = keystorePassword
+            keyAlias = keyAliasName
+            keyPassword = keyPasswordValue
+        }
+    }
+
     buildTypes {
         debug {
             isDebuggable = true
@@ -50,6 +76,13 @@ android {
             manifestPlaceholders["app_id"] = "ca-app-pub-3940256099942544~3347511713"
         }
         release {
+            val releaseKeystore = signingConfigs.getByName("release").storeFile
+            signingConfig = if (releaseKeystore != null && releaseKeystore.exists()) {
+                signingConfigs.getByName("release")
+            } else {
+                signingConfigs.getByName("debug")
+            }
+
             isMinifyEnabled = false
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
